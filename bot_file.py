@@ -19,7 +19,6 @@ try:
 except ImportError:
     HAS_TABULATE = False
 
-
 # ============================================================
 # 1. KONFIGURATION - BVH x GETABOT COMPETITION
 # ============================================================
@@ -38,8 +37,8 @@ SLIPPAGE = 0.0
 # GetaBot Expert-Modus
 COMPETITION_MODE = True
 TESTNET = False
-GETABOT_WEBHOOK_URL = "https://getabot.eu/competition/api/expert-webhook/"
-EXPERT_TOKEN = os.getenv("GETABOT_TOKEN", "DEIN_TOKEN_HIER")
+GETABOT_WEBHOOK_URL = "https://getabot.eu/competition/api/expert-webhook/"  
+GETABOT_API_TOKEN = "k5Wy55NN1z91PERl3o7s_7-UfT9b7-GbXc_YNagGghieAqE_cCEzkbhYb60X-Vm3"
 
 # Regelwerk: Signal spätestens 90 Sekunden nach Stundenschluss
 SIGNAL_DELAY_SECONDS_AFTER_HOUR = 10
@@ -1496,67 +1495,69 @@ def competition_safety_check(state: Dict[str, Any]) -> bool:
     return True
 
 
-SYMBOL_TO_CURRENCY = {
-    "BTCEUR": "BTC",
-    "ETHEUR": "ETH",
-    "XRPEUR": "XRP",
-    "DOGEEUR": "DOGE",
-}
-
-
 def build_getabot_payload(trade: Dict[str, Any]) -> Dict[str, Any]:
-    currency = SYMBOL_TO_CURRENCY.get(trade["symbol"], trade["symbol"].replace("EUR", ""))
-    signal_type = "BUY" if trade["direction"] == "long" else "SELL"
-    position_eur = float(trade["position_size"]) * float(trade["entry_price"])
-    amount_percent = min(100.0, round((position_eur / INITIAL_CAPITAL) * 100, 2))
-
     return {
-        "signal_type": signal_type,
-        "currency": currency,
-        "amount_percent": amount_percent,
-        "strategy_name": "SMC_FVG_OB_SWEEP",
-        "confidence_score": 75.0,
+        "symbol": trade["symbol"],
+        "side": "BUY",
+        "entry": round(float(trade["entry_price"]), 8),
+        "stop_loss": round(float(trade["stop_loss"]), 8),
+        "take_profit": round(float(trade["take_profit"]), 8),
+        "timestamp": str(trade["entry_time"]),
+        "strategy": "SMC_FVG_OB_SWEEP",
+        "risk_eur": round(float(trade["risk_eur"]), 2),
+        "position_size": round(float(trade["position_size"]), 8),
+        "reason": trade["setup_reasons"]
     }
 
 
+"""def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not GETABOT_WEBHOOK_URL:
+        print("[DRY RUN] GetaBot-Webhook leer. Signal wäre:")
+        print(payload)
+        return {"dry_run": True, "payload": payload}
+
+    response = requests.post(
+        GETABOT_WEBHOOK_URL,
+        json=payload,
+        timeout=20
+    )
+
+    if response.status_code >= 400:
+        logging.error(f"GetaBot Fehler {response.status_code}: {response.text}")
+        raise RuntimeError(f"GetaBot Fehler: {response.text}")
+
+    return response.json() if response.text else {"status": "sent"}"""
+
 def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not EXPERT_TOKEN or EXPERT_TOKEN == "DEIN_TOKEN_HIER":
-        print("[DRY RUN] EXPERT_TOKEN nicht gesetzt. Signal wäre:")
+
+    if not GETABOT_WEBHOOK_URL:
+        print("[DRY RUN] GetaBot-Webhook leer. Signal wäre:")
         print(payload)
         return {"dry_run": True, "payload": payload}
 
     headers = {
-        "X-Secret-Token": EXPERT_TOKEN,
         "Content-Type": "application/json",
+        "Authorization": f"Bearer {GETABOT_API_TOKEN}"
     }
 
+    response = requests.post(
+        GETABOT_WEBHOOK_URL,
+        json=payload,
+        headers=headers,
+        timeout=20
+    )
+
+    print(f"HTTP Status: {response.status_code}")
+    print(f"Response: {response.text}")
+
+    if response.status_code >= 400:
+        logging.error(f"GetaBot Fehler {response.status_code}: {response.text}")
+        raise RuntimeError(f"GetaBot Fehler: {response.text}")
+
     try:
-        response = requests.post(GETABOT_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-        data = response.json()
-
-        if response.status_code == 201:
-            logging.info(f"Signal gesendet! ID: {data.get('signal_id')} | {data.get('received_at')}")
-            return data
-
-        logging.error(f"GetaBot Fehler {response.status_code}: {data}")
-        print(f"Fehler {response.status_code}: {data.get('error')}")
-        for detail in data.get("details", []):
-            print(f"  - {detail}")
-        return {"error": True, "status": response.status_code, "data": data}
-
-    except requests.exceptions.Timeout:
-        logging.error("GetaBot Timeout")
-        print("Timeout – Server hat nicht rechtzeitig geantwortet")
-        return {"error": True, "reason": "timeout"}
-    except requests.exceptions.ConnectionError:
-        logging.error("GetaBot ConnectionError")
-        print("ConnectionError – Server nicht erreichbar")
-        return {"error": True, "reason": "connection_error"}
-    except Exception as e:
-        logging.error(f"GetaBot unerwarteter Fehler: {e}")
-        print(f"Unerwarteter Fehler: {e}")
-        return {"error": True, "reason": str(e)}
-
+        return response.json()
+    except:
+        return {"status": "sent", "response": response.text}
 
 def generate_latest_signal_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     df = fetch_binance_klines(symbol, INTERVAL, LIMIT)
@@ -1815,4 +1816,3 @@ if __name__ == "__main__":
         main_getabot_live_loop()
     else:
         main_backtest()
-        
