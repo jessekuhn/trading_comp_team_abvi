@@ -27,7 +27,7 @@ except ImportError:
 SYMBOLS = ["BTCEUR", "ETHEUR", "DOGEEUR", "XRPEUR"]
 
 INTERVAL = "1h"
-LIMIT = 7500
+LIMIT = 1000
 
 INITIAL_CAPITAL = 10_000.0
 
@@ -36,9 +36,9 @@ FEE_RATE = 0.0
 SLIPPAGE = 0.0
 
 # GetaBot Expert-Modus
-COMPETITION_MODE = False
-GETABOT_WEBHOOK_URL = "https://getabot.eu/competition/api/expert-webhook/"
-EXPERT_TOKEN = os.getenv("GETABOT_TOKEN", "k5Wy55NN1z91PERl3o7s_7-UfT9b7-GbXc_YNagGghieAqE_cCEzkbhYb60X-Vm3")  # Token hier eintragen oder als Env-Variable setzen
+COMPETITION_MODE = True
+TESTNET = False
+GETABOT_WEBHOOK_URL = ""  # später: https://getabot.eu/webhook/{team_id}
 
 # Regelwerk: Signal spätestens 90 Sekunden nach Stundenschluss
 SIGNAL_DELAY_SECONDS_AFTER_HOUR = 10
@@ -62,13 +62,13 @@ MAX_DAILY_LOSS_PCT = 0.05
 ENTRY_DELAY_CANDLES = 1
 
 SWING_LOOKBACK = 2
-FVG_MAX_AGE = 300
+FVG_MAX_AGE = 650
 
 ATR_PERIOD = 14
-MIN_IMPULSE_ATR_MULT = 0.6
+MIN_IMPULSE_ATR_MULT = 0.45
 OB_SEARCH_BACK = 15
 OB_MAX_AGE = 300
-OB_PROXIMITY_PCT = 0.03
+OB_PROXIMITY_PCT = 0.025
 OB_MAX_WIDTH_ATR_MULT = 2.0
 
 USE_VOLUME_FILTER = True
@@ -77,7 +77,7 @@ MIN_VOLUME_MULT = 1.0
 
 LIQUIDITY_LOOKBACK = 20
 SWEEP_MAX_AGE = 120
-MIN_WICK_RATIO = 0.3
+MIN_WICK_RATIO = 0.22
 MAX_SWEEP_DISTANCE_ATR_MULT = 2.0
 
 MIN_RISK_REWARD = 1.5
@@ -797,7 +797,7 @@ def apply_slippage(price: float, direction: str, action: str) -> float:
             return open_trade["take_profit"], "Take Profit"
 
     return None, None"""
-def check_exit(open_trade: Dict, candle: pd.Series) -> Tuple[Optional[float], Optional[str]]:
+"""def check_exit(open_trade: Dict, candle: pd.Series) -> Tuple[Optional[float], Optional[str]]:
     direction = open_trade["direction"]
 
     if direction == "long":
@@ -825,6 +825,62 @@ def check_exit(open_trade: Dict, candle: pd.Series) -> Tuple[Optional[float], Op
 
         if hit_tp:
             return open_trade["take_profit"], "Take Profit"
+
+    return None, None"""
+
+def check_exit(open_trade: Dict, candle: pd.Series) -> Tuple[Optional[float], Optional[str]]:
+    direction = open_trade["direction"]
+
+    entry = open_trade["entry_price"]
+    stop = open_trade["stop_loss"]
+    tp = open_trade["take_profit"]
+
+    if direction == "long":
+        hit_sl = candle["low"] <= stop
+        hit_tp = candle["high"] >= tp
+
+        # FALL 1: Nur SL
+        if hit_sl and not hit_tp:
+            return stop, "Stop Loss"
+
+        # FALL 2: Nur TP
+        if hit_tp and not hit_sl:
+            return tp, "Take Profit"
+
+        # FALL 3: BEIDES in gleicher Kerze → realistische Approximation
+        if hit_sl and hit_tp:
+            # Annahme: Bewegung beginnt vom Open der Kerze
+            open_price = candle["open"]
+
+            dist_to_sl = abs(open_price - stop)
+            dist_to_tp = abs(open_price - tp)
+
+            # Das Level, das näher am Open liegt, wird zuerst erreicht
+            if dist_to_tp < dist_to_sl:
+                return tp, "Take Profit (same candle realistic)"
+            else:
+                return stop, "Stop Loss (same candle realistic)"
+
+    if direction == "short":
+        hit_sl = candle["high"] >= stop
+        hit_tp = candle["low"] <= tp
+
+        if hit_sl and not hit_tp:
+            return stop, "Stop Loss"
+
+        if hit_tp and not hit_sl:
+            return tp, "Take Profit"
+
+        if hit_sl and hit_tp:
+            open_price = candle["open"]
+
+            dist_to_sl = abs(open_price - stop)
+            dist_to_tp = abs(open_price - tp)
+
+            if dist_to_tp < dist_to_sl:
+                return tp, "Take Profit (same candle realistic)"
+            else:
+                return stop, "Stop Loss (same candle realistic)"
 
     return None, None
 
@@ -1347,7 +1403,7 @@ def calculate_live_position_size(capital: float, entry: float, stop_loss: float)
     return risk_eur / risk_per_unit
 
 
-def place_spot_market_order(symbol: str, side: str, quantity: float) -> Dict[str, Any]:
+"""def place_spot_market_order(symbol: str, side: str, quantity: float) -> Dict[str, Any]:
     params = {
         "symbol": symbol,
         "side": side,
@@ -1361,8 +1417,26 @@ def place_spot_market_order(symbol: str, side: str, quantity: float) -> Dict[str
         print(f"[DRY RUN] Order nicht gesendet: {params}")
         return {"dry_run": True, "params": params}
 
-    return binance_signed_request("POST", "/api/v3/order", params)
+    return binance_signed_request("POST", "/api/v3/order", params)"""
 
+def place_spot_market_order(symbol: str, side: str, quantity: float) -> Dict[str, Any]:
+    params = {
+        "symbol": symbol,
+        "side": side,
+        "type": "MARKET",
+        "quantity": quantity
+    }
+
+    logging.info(f"Signal erzeugt: {params}")
+
+    # Für GetaBot Competition:
+    # Keine echten Binance Orders senden
+    print(f"[GETABOT SIGNAL] {params}")
+
+    return {
+        "signal_only": True,
+        "params": params
+    }
 
 # ============================================================
 # 18. GETABOT LIVE COMPETITION
@@ -1412,8 +1486,8 @@ def competition_safety_check(state: Dict[str, Any]) -> bool:
     if state["trades_today"] >= MAX_TRADES_PER_DAY:
         return False
 
-    if len(state["open_positions"]) >= MAX_OPEN_POSITIONS:
-        return False
+    """if len(state["open_positions"]) >= MAX_OPEN_POSITIONS:
+        return False"""
 
     if state["daily_pnl"] <= -INITIAL_CAPITAL * MAX_DAILY_LOSS_PCT:
         return False
@@ -1421,66 +1495,38 @@ def competition_safety_check(state: Dict[str, Any]) -> bool:
     return True
 
 
-SYMBOL_TO_CURRENCY = {
-    "BTCEUR": "BTC",
-    "ETHEUR": "ETH",
-    "XRPEUR": "XRP",
-    "DOGEEUR": "DOGE",
-}
-
-
 def build_getabot_payload(trade: Dict[str, Any]) -> Dict[str, Any]:
-    currency = SYMBOL_TO_CURRENCY.get(trade["symbol"], trade["symbol"].replace("EUR", ""))
-    signal_type = "BUY" if trade["direction"] == "long" else "SELL"
-    position_eur = float(trade["position_size"]) * float(trade["entry_price"])
-    amount_percent = min(100.0, round((position_eur / INITIAL_CAPITAL) * 100, 2))
-
     return {
-        "signal_type": signal_type,
-        "currency": currency,
-        "amount_percent": amount_percent,
-        "strategy_name": "SMC_FVG_OB_SWEEP",
-        "confidence_score": 75.0,
+        "symbol": trade["symbol"],
+        "side": "BUY",
+        "entry": round(float(trade["entry_price"]), 8),
+        "stop_loss": round(float(trade["stop_loss"]), 8),
+        "take_profit": round(float(trade["take_profit"]), 8),
+        "timestamp": str(trade["entry_time"]),
+        "strategy": "SMC_FVG_OB_SWEEP",
+        "risk_eur": round(float(trade["risk_eur"]), 2),
+        "position_size": round(float(trade["position_size"]), 8),
+        "reason": trade["setup_reasons"]
     }
 
 
 def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not EXPERT_TOKEN or EXPERT_TOKEN == "DEIN_TOKEN_HIER":
-        print("[DRY RUN] EXPERT_TOKEN nicht gesetzt. Signal wäre:")
+    if not GETABOT_WEBHOOK_URL:
+        print("[DRY RUN] GetaBot-Webhook leer. Signal wäre:")
         print(payload)
         return {"dry_run": True, "payload": payload}
 
-    headers = {
-        "X-Secret-Token": EXPERT_TOKEN,
-        "Content-Type": "application/json",
-    }
+    response = requests.post(
+        GETABOT_WEBHOOK_URL,
+        json=payload,
+        timeout=20
+    )
 
-    try:
-        response = requests.post(GETABOT_WEBHOOK_URL, json=payload, headers=headers, timeout=30)
-        data = response.json()
+    if response.status_code >= 400:
+        logging.error(f"GetaBot Fehler {response.status_code}: {response.text}")
+        raise RuntimeError(f"GetaBot Fehler: {response.text}")
 
-        if response.status_code == 201:
-            logging.info(f"Signal gesendet! ID: {data.get('signal_id')} | {data.get('received_at')}")
-            return data
-
-        logging.error(f"GetaBot Fehler {response.status_code}: {data}")
-        print(f"Fehler {response.status_code}: {data.get('error')}")
-        for detail in data.get("details", []):
-            print(f"  - {detail}")
-        return {"error": True, "status": response.status_code, "data": data}
-
-    except requests.exceptions.Timeout:
-        logging.error("GetaBot Timeout")
-        print("Timeout – Server hat nicht rechtzeitig geantwortet")
-        return {"error": True, "reason": "timeout"}
-    except requests.exceptions.ConnectionError:
-        logging.error("GetaBot ConnectionError")
-        print("ConnectionError – Server nicht erreichbar")
-        return {"error": True, "reason": "connection_error"}
-    except Exception as e:
-        logging.error(f"GetaBot unerwarteter Fehler: {e}")
-        print(f"Unerwarteter Fehler: {e}")
-        return {"error": True, "reason": str(e)}
+    return response.json() if response.text else {"status": "sent"}
 
 
 def generate_latest_signal_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
@@ -1556,14 +1602,14 @@ def main_getabot_live_loop() -> None:
                 state["last_signal_hour"][symbol] = str(signal_hour)
                 state["trades_today"] += 1
 
-                state["open_positions"][symbol] = {
+                """state["open_positions"][symbol] = {
                     "entry_time": str(signal["entry_time"]),
                     "entry_price": signal["entry_price"],
                     "stop_loss": signal["stop_loss"],
                     "take_profit": signal["take_profit"],
                     "risk_eur": signal["risk_eur"],
                     "direction": signal["direction"]
-                }
+                }"""
 
                 save_live_state(state)
 
@@ -1716,21 +1762,21 @@ def main_backtest() -> None:
             print(f"{symbol}: übersprungen wegen Fehler: {e}")
             logging.warning(f"{symbol}: übersprungen wegen Fehler: {e}")
 
-        if not data_by_symbol:
-            raise RuntimeError("Keine gültigen Daten geladen.")
+    if not data_by_symbol:
+        raise RuntimeError("Keine gültigen Daten geladen.")
 
-        run_named_backtest("FULL SAMPLE", data_by_symbol)
+    run_named_backtest("FULL SAMPLE", data_by_symbol)
 
-        walk_forward_results = run_walk_forward(data_by_symbol)
+    walk_forward_results = run_walk_forward(data_by_symbol)
 
-        print("\n" + "=" * 100)
-        print("WALK-FORWARD GESAMTÜBERSICHT")
-        print("=" * 100)
+    print("\n" + "=" * 100)
+    print("WALK-FORWARD GESAMTÜBERSICHT")
+    print("=" * 100)
 
-        if HAS_TABULATE:
-            print(tabulate(walk_forward_results, headers="keys", tablefmt="fancy_grid", showindex=False))
-        else:
-            print(walk_forward_results.to_string(index=False))
+    if HAS_TABULATE:
+        print(tabulate(walk_forward_results, headers="keys", tablefmt="fancy_grid", showindex=False))
+    else:
+        print(walk_forward_results.to_string(index=False))
 # ============================================================
 # 21. START
 # ============================================================
@@ -1740,3 +1786,4 @@ if __name__ == "__main__":
         main_getabot_live_loop()
     else:
         main_backtest()
+        
