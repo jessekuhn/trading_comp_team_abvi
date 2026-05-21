@@ -8,6 +8,11 @@ import requests
 import pandas as pd
 import numpy as np
 
+import psutil
+import tracemalloc
+from functools import wraps
+from time import perf_counter
+
 from math import sqrt
 from urllib.parse import urlencode
 from typing import Optional, Dict, List, Any, Tuple
@@ -26,7 +31,7 @@ except ImportError:
 SYMBOLS = ["BTCEUR", "ETHEUR", "DOGEEUR", "XRPEUR"]
 
 INTERVAL = "1h"
-LIMIT = 1000
+LIMIT = 10000
 
 INITIAL_CAPITAL = 10_000.0
 
@@ -38,14 +43,15 @@ SLIPPAGE = 0.0
 COMPETITION_MODE = True
 TESTNET = False
 GETABOT_WEBHOOK_URL = "https://getabot.eu/competition/api/expert-webhook/"  
-GETABOT_API_TOKEN = "k5Wy55NN1z91PERl3o7s_7-UfT9b7-GbXc_YNagGghieAqE_cCEzkbhYb60X-Vm3"
+GETABOT_API_TOKEN = os.getenv("GETABOT_API_TOKEN")
 
 # Regelwerk: Signal spätestens 90 Sekunden nach Stundenschluss
 SIGNAL_DELAY_SECONDS_AFTER_HOUR = 10
 MAX_SIGNAL_SECONDS_AFTER_HOUR = 90
 LIVE_POLL_SECONDS = 5
 
-STATE_FILE = "getabot_live_state.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "getabot_live_state.json")
 
 # Nur Kaufsignale / Spot-Logik
 ALLOW_SHORTS = False
@@ -128,11 +134,81 @@ BINANCE_TESTNET_URL = "https://testnet.binance.vision"
 # ============================================================
 
 logging.basicConfig(
-    filename="smc_getabot_bot.log",
+    filename=os.path.join(BASE_DIR, "smc_getabot_bot.log"),
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+PERF_LOG_FILE = os.path.join(BASE_DIR, "performance_monitor.log")
+
+perf_logger = logging.getLogger("performance")
+perf_logger.setLevel(logging.INFO)
+
+perf_handler = logging.FileHandler(PERF_LOG_FILE)
+perf_handler.setFormatter(logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+))
+
+if not perf_logger.handlers:
+    perf_logger.addHandler(perf_handler)
+
+PROCESS = psutil.Process(os.getpid())
+tracemalloc.start()
+
+
+def log_system_metrics(label: str = "SYSTEM") -> None:
+    cpu = psutil.cpu_percent(interval=None)
+    ram = psutil.virtual_memory()
+    proc_mem = PROCESS.memory_info().rss / 1024 / 1024
+
+    current, peak = tracemalloc.get_traced_memory()
+
+    perf_logger.info(
+        f"{label} | "
+        f"CPU={cpu:.2f}% | "
+        f"RAM_USED={ram.percent:.2f}% | "
+        f"PROCESS_RSS={proc_mem:.2f}MB | "
+        f"TRACEMALLOC_CURRENT={current / 1024 / 1024:.2f}MB | "
+        f"TRACEMALLOC_PEAK={peak / 1024 / 1024:.2f}MB"
+    )
+
+    if cpu > 85:
+        perf_logger.warning(f"HIGH_CPU | CPU={cpu:.2f}%")
+
+    if ram.percent > 85:
+        perf_logger.warning(f"HIGH_RAM | RAM={ram.percent:.2f}%")
+
+    if proc_mem > 1000:
+        perf_logger.warning(f"HIGH_PROCESS_MEMORY | RSS={proc_mem:.2f}MB")
+
+
+def monitor_function(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = perf_counter()
+        mem_before = PROCESS.memory_info().rss / 1024 / 1024
+
+        try:
+            return func(*args, **kwargs)
+
+        except Exception as e:
+            perf_logger.exception(f"ERROR in {func.__name__}: {e}")
+            raise
+
+        finally:
+            duration = perf_counter() - start
+            mem_after = PROCESS.memory_info().rss / 1024 / 1024
+            mem_delta = mem_after - mem_before
+
+            perf_logger.info(
+                f"FUNC={func.__name__} | "
+                f"DURATION={duration:.4f}s | "
+                f"MEM_BEFORE={mem_before:.2f}MB | "
+                f"MEM_AFTER={mem_after:.2f}MB | "
+                f"MEM_DELTA={mem_delta:.2f}MB"
+            )
+
+    return wrapper
 
 # ============================================================
 # 3. PARAMETER-HILFSFUNKTIONEN
@@ -145,7 +221,7 @@ def get_symbol_param(symbol: str, param_name: str, default_value: Any) -> Any:
 # ============================================================
 # 4. BINANCE DATA
 # ============================================================
-
+@monitor_function
 def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -> pd.DataFrame:
     endpoint = "/api/v3/klines"
     max_per_request = 1000
@@ -168,7 +244,17 @@ def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -
                 if end_time is not None:
                     params["endTime"] = end_time
 
+                request_start = perf_counter()
+
                 response = requests.get(base_url + endpoint, params=params, timeout=20)
+
+                latency = perf_counter() - request_start
+
+                perf_logger.info(
+                    f"API_LATENCY | symbol={symbol} | url={base_url} | "
+                    f"limit={request_limit} | latency={latency:.4f}s | "
+                    f"status={response.status_code}"
+                )
                 response.raise_for_status()
                 data = response.json()
 
@@ -210,7 +296,7 @@ def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -
 
     raise RuntimeError(f"Konnte keine Daten für {symbol} laden.")
 
-
+@monitor_function
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -962,7 +1048,7 @@ def mark_to_market_equity(
 # ============================================================
 # 14. BACKTEST
 # ============================================================
-
+@monitor_function
 def backtest(data_by_symbol: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
     capital = INITIAL_CAPITAL
     trades = []
@@ -997,6 +1083,8 @@ def backtest(data_by_symbol: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.
     ))
 
     for current_time in all_dates:
+        if len(equity_records) % 500 == 0:
+            log_system_metrics(f"BACKTEST_PROGRESS time={current_time}")
         candles_at_time = {}
 
         for symbol in list(state.keys()):
@@ -1528,6 +1616,7 @@ def build_getabot_payload(trade: Dict[str, Any]) -> Dict[str, Any]:
 
     return response.json() if response.text else {"status": "sent"}"""
 
+@monitor_function
 def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if not GETABOT_WEBHOOK_URL:
@@ -1540,12 +1629,28 @@ def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
         "Authorization": f"Bearer {GETABOT_API_TOKEN}"
     }
 
+    """response = requests.post(
+        GETABOT_WEBHOOK_URL,
+        json=payload,
+        headers=headers,
+        timeout=20
+    )"""
+    request_start = perf_counter()
+
     response = requests.post(
         GETABOT_WEBHOOK_URL,
         json=payload,
         headers=headers,
         timeout=20
     )
+
+    latency = perf_counter() - request_start
+
+    perf_logger.info(
+        f"GETABOT_LATENCY | latency={latency:.4f}s | "
+        f"status={response.status_code}"
+    )
+
 
     print(f"HTTP Status: {response.status_code}")
     print(f"Response: {response.text}")
@@ -1559,6 +1664,7 @@ def send_getabot_signal(payload: Dict[str, Any]) -> Dict[str, Any]:
     except:
         return {"status": "sent", "response": response.text}
 
+@monitor_function
 def generate_latest_signal_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     df = fetch_binance_klines(symbol, INTERVAL, LIMIT)
     df = add_indicators(df)
@@ -1595,69 +1701,73 @@ def generate_latest_signal_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def main_getabot_live_loop() -> None:
-    print("Starte BVH x GetaBot Expert-Modus Bot...")
+def main_getabot_once() -> None:
+    print("Starte BVH x GetaBot One-Shot Bot...")
     print(f"Webhook gesetzt: {bool(GETABOT_WEBHOOK_URL)}")
     print(f"Handelspaare: {SYMBOLS}")
-    print("Modus: DRY RUN" if not GETABOT_WEBHOOK_URL else "Modus: LIVE WEBHOOK")
+    print("Modus: LIVE WEBHOOK")
+
+    if not GETABOT_API_TOKEN:
+        raise RuntimeError("GETABOT_API_TOKEN fehlt. Bitte als Umgebungsvariable setzen.")
 
     state = load_live_state()
+    state = reset_daily_limits_if_new_day(state)
 
-    while True:
-        try:
-            state = reset_daily_limits_if_new_day(state)
+    sec = seconds_after_hour()
 
-            if not is_signal_window():
-                time.sleep(LIVE_POLL_SECONDS)
-                continue
+    # Falls Cron exakt zur vollen Stunde startet, kurz warten,
+    # damit Signal frühestens nach SIGNAL_DELAY_SECONDS_AFTER_HOUR gesendet wird.
+    if sec < SIGNAL_DELAY_SECONDS_AFTER_HOUR:
+        wait_seconds = SIGNAL_DELAY_SECONDS_AFTER_HOUR - sec
+        print(f"Warte {wait_seconds} Sekunden bis Signal-Fenster beginnt...")
+        time.sleep(wait_seconds)
 
-            for symbol in SYMBOLS:
-                if not competition_safety_check(state):
-                    continue
+    if not is_signal_window():
+        print("Außerhalb des erlaubten Signal-Fensters. Kein Signal gesendet.")
+        save_live_state(state)
+        return
 
-                signal = generate_latest_signal_for_symbol(symbol)
+    if not competition_safety_check(state):
+        print("Competition Safety Check nicht bestanden. Kein Signal gesendet.")
+        save_live_state(state)
+        return
 
-                if signal is None:
-                    continue
+    signals_sent_this_run = 0
+    MAX_SIGNALS_PER_RUN = 1
 
-                signal_hour = pd.Timestamp(signal["entry_time"]).floor("h")
-                last_signal_hour = state["last_signal_hour"].get(symbol)
-
-                if last_signal_hour == str(signal_hour):
-                    continue
-
-                payload = build_getabot_payload(signal)
-                result = send_getabot_signal(payload)
-
-                state["last_signal_hour"][symbol] = str(signal_hour)
-                state["trades_today"] += 1
-
-                """state["open_positions"][symbol] = {
-                    "entry_time": str(signal["entry_time"]),
-                    "entry_price": signal["entry_price"],
-                    "stop_loss": signal["stop_loss"],
-                    "take_profit": signal["take_profit"],
-                    "risk_eur": signal["risk_eur"],
-                    "direction": signal["direction"]
-                }"""
-
-                save_live_state(state)
-
-                print(f"Signal für {symbol} gesendet:")
-                print(result)
-
-            time.sleep(LIVE_POLL_SECONDS)
-
-        except KeyboardInterrupt:
-            print("Bot manuell gestoppt.")
-            save_live_state(state)
+    for symbol in SYMBOLS:
+        if signals_sent_this_run >= MAX_SIGNALS_PER_RUN:
             break
 
-        except Exception as e:
-            logging.error(f"Live Loop Fehler: {e}")
-            print(f"Live Loop Fehler: {e}")
-            time.sleep(LIVE_POLL_SECONDS)
+        signal = generate_latest_signal_for_symbol(symbol)
 
+        if signal is None:
+            print(f"{symbol}: Kein gültiges Signal.")
+            continue
+
+        signal_hour = pd.Timestamp(signal["entry_time"]).floor("h")
+        last_signal_hour = state["last_signal_hour"].get(symbol)
+
+        if last_signal_hour == str(signal_hour):
+            print(f"{symbol}: Signal für diese Stunde bereits gesendet.")
+            continue
+
+        payload = build_getabot_payload(signal)
+        result = send_getabot_signal(payload)
+
+        state["last_signal_hour"][symbol] = str(signal_hour)
+        state["trades_today"] += 1
+        signals_sent_this_run += 1
+
+        save_live_state(state)
+
+        print(f"Signal für {symbol} gesendet:")
+        print(result)
+
+    if signals_sent_this_run == 0:
+        print("Kein Signal in diesem Lauf gesendet.")
+
+    save_live_state(state)
 
 # ============================================================
 # 19. AUSGABE
@@ -1719,6 +1829,7 @@ def run_named_backtest(name: str, data_by_symbol: Dict[str, pd.DataFrame]) -> No
     print(f"Gesamtrendite: {(final_capital / INITIAL_CAPITAL - 1) * 100:.2f}%")
     print(f"Zeitbasierte Sharpe Ratio: {sharpe_ratio_time_based(equity_df):.2f}")"""
 
+@monitor_function
 def run_walk_forward(data_by_symbol: Dict[str, pd.DataFrame]):
 
     print("\n" + "#" * 100)
@@ -1813,6 +1924,6 @@ def main_backtest() -> None:
 
 if __name__ == "__main__":
     if COMPETITION_MODE:
-        main_getabot_live_loop()
+        main_getabot_once()
     else:
         main_backtest()
