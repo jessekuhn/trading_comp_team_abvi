@@ -7,6 +7,8 @@ import logging
 import requests
 import pandas as pd
 import numpy as np
+from dotenv import load_dotenv
+import os
 
 import psutil
 import tracemalloc
@@ -17,6 +19,7 @@ from math import sqrt
 from urllib.parse import urlencode
 from typing import Optional, Dict, List, Any, Tuple
 
+load_dotenv()
 
 try:
     from tabulate import tabulate
