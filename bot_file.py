@@ -131,6 +131,18 @@ DATA_BASE_URLS = [
 BINANCE_LIVE_URL = "https://api.binance.com"
 BINANCE_TESTNET_URL = "https://testnet.binance.vision"
 
+# ------------------------------------------------------------------
+# Proxy support: Binance returns HTTP 451 from cloud-server IPs
+# (Google Cloud etc.). Set BINANCE_PROXY in the .env to route Binance
+# data requests through an allowed IP, e.g.:
+#   BINANCE_PROXY=http://user:pass@proxy-host:port
+# If left empty, requests go direct (works on a normal local machine).
+# ------------------------------------------------------------------
+BINANCE_PROXY = os.getenv("BINANCE_PROXY", "").strip()
+BINANCE_PROXIES = (
+    {"http": BINANCE_PROXY, "https": BINANCE_PROXY} if BINANCE_PROXY else None
+)
+
 
 # ============================================================
 # 2. LOGGING
@@ -249,7 +261,20 @@ def fetch_binance_klines(symbol: str, interval: str = "1h", limit: int = 1000) -
 
                 request_start = perf_counter()
 
-                response = requests.get(base_url + endpoint, params=params, timeout=20)
+                response = requests.get(
+                    base_url + endpoint,
+                    params=params,
+                    timeout=20,
+                    proxies=BINANCE_PROXIES,
+                )
+
+                if response.status_code == 451:
+                    raise RuntimeError(
+                        "HTTP 451: Binance blockiert diese Server-IP "
+                        "(Restricted Location). Auf einem Google-Cloud-Server "
+                        "muss BINANCE_PROXY in der .env gesetzt werden, um den "
+                        "Datenabruf ueber eine erlaubte IP zu leiten."
+                    )
 
                 latency = perf_counter() - request_start
 
@@ -1553,7 +1578,7 @@ def save_live_state(state: Dict[str, Any]) -> None:
 
 
 def reset_daily_limits_if_new_day(state: Dict[str, Any]) -> Dict[str, Any]:
-    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    today = pd.Timestamp.now("UTC").strftime("%Y-%m-%d")
 
     if state.get("current_day") != today:
         state["current_day"] = today
@@ -1564,11 +1589,15 @@ def reset_daily_limits_if_new_day(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def seconds_after_hour() -> int:
-    now = pd.Timestamp.utcnow()
+    now = pd.Timestamp.now("UTC")
     return now.minute * 60 + now.second
 
 
+FORCE_SIGNAL_WINDOW = False  # auf True gesetzt durch --force / FORCE_RUN
+
 def is_signal_window() -> bool:
+    if FORCE_SIGNAL_WINDOW:
+        return True
     sec = seconds_after_hour()
     return SIGNAL_DELAY_SECONDS_AFTER_HOUR <= sec <= MAX_SIGNAL_SECONDS_AFTER_HOUR
 
@@ -1720,7 +1749,7 @@ def main_getabot_once() -> None:
 
     # Falls Cron exakt zur vollen Stunde startet, kurz warten,
     # damit Signal frühestens nach SIGNAL_DELAY_SECONDS_AFTER_HOUR gesendet wird.
-    if sec < SIGNAL_DELAY_SECONDS_AFTER_HOUR:
+    if sec < SIGNAL_DELAY_SECONDS_AFTER_HOUR and not FORCE_SIGNAL_WINDOW:
         wait_seconds = SIGNAL_DELAY_SECONDS_AFTER_HOUR - sec
         print(f"Warte {wait_seconds} Sekunden bis Signal-Fenster beginnt...")
         time.sleep(wait_seconds)
@@ -1742,7 +1771,12 @@ def main_getabot_once() -> None:
         if signals_sent_this_run >= MAX_SIGNALS_PER_RUN:
             break
 
-        signal = generate_latest_signal_for_symbol(symbol)
+        try:
+            signal = generate_latest_signal_for_symbol(symbol)
+        except Exception as e:
+            print(f"{symbol}: Fehler bei der Signal-Erzeugung: {e}")
+            logging.warning(f"{symbol}: Fehler bei der Signal-Erzeugung: {e}")
+            continue
 
         if signal is None:
             print(f"{symbol}: Kein gültiges Signal.")
@@ -1925,8 +1959,36 @@ def main_backtest() -> None:
 # 21. START
 # ============================================================
 
+def selftest() -> None:
+    """Quick connectivity check: can we reach Binance from this machine?"""
+    print("=== SELF-TEST: Binance-Erreichbarkeit ===")
+    print(f"Proxy aktiv: {bool(BINANCE_PROXIES)}")
+    print(f"GETABOT_API_TOKEN gesetzt: {bool(GETABOT_API_TOKEN)}")
+    try:
+        df = fetch_binance_klines(SYMBOLS[0], INTERVAL, 5)
+        print(f"OK - {len(df)} Kerzen fuer {SYMBOLS[0]} geladen.")
+        print(df.tail(3).to_string())
+    except Exception as e:
+        print(f"FEHLER beim Datenabruf: {e}")
+
+
 if __name__ == "__main__":
-    if COMPETITION_MODE:
-        main_getabot_once()
+    import sys
+
+    args = sys.argv[1:]
+
+    # python3 bot_file.py --selftest   -> nur Verbindung pruefen
+    if "--selftest" in args:
+        selftest()
+    # python3 bot_file.py --force      -> Signal-Fenster ignorieren (zum Testen)
+    elif "--force" in args or os.getenv("FORCE_RUN", "").lower() in ("1", "true", "yes"):
+        FORCE_SIGNAL_WINDOW = True
+        if COMPETITION_MODE:
+            main_getabot_once()
+        else:
+            main_backtest()
     else:
-        main_backtest()
+        if COMPETITION_MODE:
+            main_getabot_once()
+        else:
+            main_backtest()
