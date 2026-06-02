@@ -77,23 +77,23 @@ ATR_PERIOD = 14
 MIN_IMPULSE_ATR_MULT = 0.45
 OB_SEARCH_BACK = 15
 OB_MAX_AGE = 300
-OB_PROXIMITY_PCT = 0.025
+OB_PROXIMITY_PCT = 0.04
 OB_MAX_WIDTH_ATR_MULT = 2.0
 
-USE_VOLUME_FILTER = True
+USE_VOLUME_FILTER = False
 VOLUME_LOOKBACK = 20
 MIN_VOLUME_MULT = 1.0
 
 LIQUIDITY_LOOKBACK = 20
 SWEEP_MAX_AGE = 120
-MIN_WICK_RATIO = 0.22
+MIN_WICK_RATIO = 0.15
 MAX_SWEEP_DISTANCE_ATR_MULT = 2.0
 
 MIN_RISK_REWARD = 1.5
 MIN_STOP_DISTANCE_ATR_MULT = 0.10
 MAX_STOP_DISTANCE_ATR_MULT = 3.0
 
-ENTRY_TOLERANCE_PCT_OF_FVG = 0.6
+ENTRY_TOLERANCE_PCT_OF_FVG = 1.0
 
 """SYMBOL_PARAM_OVERRIDES = {
     "BTCEUR": {
@@ -1714,7 +1714,7 @@ def generate_latest_signal_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     last_closed_candle_time = df["date"].iloc[-1]
     trade_time = pd.Timestamp(latest_trade["Entry-Zeitpunkt"])
 
-    if trade_time < last_closed_candle_time - pd.Timedelta(hours=1):
+    if trade_time < last_closed_candle_time - pd.Timedelta(hours=3):
         return None
 
     if latest_trade["Richtung"] != "long":
